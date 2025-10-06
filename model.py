@@ -1,6 +1,92 @@
 import torch
 import torch.nn as nn
 
+
+class NonLocalBlock(nn.Module):
+    def __init__(self, in_channels, inter_channels=None):
+        super(NonLocalBlock, self).__init__()
+        self.in_channels = in_channels
+        self.inter_channels = inter_channels
+        if inter_channels is None:
+            self.inter_channels = in_channels // 2
+            if inter_channels == 0:
+                inter_channels = 1
+        conv_nd = nn.Conv2d
+        max_pool_layer = nn.MaxPool2d(kernel_size=(2, 2))
+        bn = nn.BatchNorm2d
+
+        self.g = nn.Conv2d(self.in_channels, self.inter_channels, kernel_size=1)
+
+        self.W_z = conv_nd(in_channels=self.inter_channels, out_channels=self.in_channels, kernel_size=1)
+
+    def forward(self, x):
+        batch_size = x.size(0)
+        g_x = self.g(x).view(batch_size, self.inter_channels, -1)
+        g_x = g_x.permute(0, 2, 1)
+
+        theta_x = x.view(batch_size, self.in_channels, -1)
+        phi_x = x.view(batch_size, self.in_channels, -1)
+        theta_x = theta_x.permute(0, 2, 1)
+        f = torch.matmul(theta_x, phi_x)
+
+        f_div_C = F.softmax(f, dim=-1)
+
+        y = torch.matmul(f_div_C, g_x)
+
+        y = y.permute(0, 2, 1).contiguous()
+        y = y.view(batch_size, self.inter_channels, *x.size()[2:])
+
+        W_y = self.W_z(y)
+        z = W_y + x
+        return z
+
+
+class GCM(nn.Module):
+    def __init__(self, in_c, out_c, rate=[3, 6, 9]):
+        super().__init__()
+
+        self.c1 = nn.Sequential(
+            nn.Conv2d(in_c, out_c//5, kernel_size=3, dilation=rate[0], padding=rate[0]),
+            nn.BatchNorm2d(out_c//5),
+            nn.ReLU(inplace=True)
+        )
+
+        self.c2 = nn.Sequential(
+            nn.Conv2d(in_c, out_c//5, kernel_size=3, dilation=rate[1], padding=rate[1]),
+            nn.BatchNorm2d(out_c//5),
+            nn.ReLU(inplace=True)
+        )
+
+        self.c3 = nn.Sequential(
+            nn.Conv2d(in_c, out_c//5, kernel_size=3, dilation=rate[2], padding=rate[2]),
+            nn.BatchNorm2d(out_c//5),
+            nn.ReLU(inplace=True)
+        )
+
+        self.c4 = nn.Sequential(
+            nn.Conv2d(in_c, out_c//5, kernel_size=1),
+            nn.BatchNorm2d(out_c//5),
+            nn.ReLU(inplace=True)
+
+        )
+
+
+
+        self.c5 = nn.Conv2d(in_c, out_c//5, kernel_size=1, padding=0)
+        self.non_local = NonLocalBlock(out_c//5)
+        self.conv1 = nn.Conv2d((out_c//5)*5, out_c, kernel_size=1)
+
+    def forward(self, inputs):
+        x1 = self.c1(inputs)
+        x2 = self.c2(inputs)
+        x3 = self.c3(inputs)
+        x4 = self.c4(inputs)
+        x5 = self.c5(inputs)
+        x5 = self.non_local(x5)
+        x = torch.cat((x1, x2, x3, x4, x5), axis=1)
+        x = self.conv1(x)
+        return x
+
 """ Convolutional block:
     It follows a two 3x3 convolutional layer, each followed by a batch normalization and a relu activation.
 """
@@ -76,6 +162,7 @@ class build_model(nn.Module):
 
         """ Bottleneck """
         self.b = conv_block(512, 1024)
+        self.gcm = GCM(1024, 1024)
 
         """ Decoder """
         self.d1 = decoder_block(1024, 512)
@@ -95,12 +182,18 @@ class build_model(nn.Module):
 
         """ Bottleneck """
         b = self.b(p4)
+        b = self.gcm(b)
 
         """ Decoder """
         d1 = self.d1(b, s4)
         d2 = self.d2(d1, s3)
         d3 = self.d3(d2, s2)
         d4 = self.d4(d3, s1)
+
+        """ Classifier """
+        outputs = self.outputs(d4)
+
+        return outputs
 
         """ Classifier """
         outputs = self.outputs(d4)
